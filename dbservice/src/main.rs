@@ -14,8 +14,6 @@ use zkwasm_host_circuits::proof::MERKLE_DEPTH;
 
 use std::time::Instant;
 
-//use tokio::runtime::Runtime;
-
 static mut DB: Option<Rc<RefCell<dyn TreeDB>>> = None;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -24,6 +22,7 @@ pub struct UpdateLeafRequest {
     data: [u8; 32],
     index: String, // u64 encoding
 }
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct GetLeafRequest {
     root: [u8; 32],
@@ -35,6 +34,7 @@ pub struct UpdateRecordRequest {
     hash: [u8; 32],
     data: Vec<String>, // vec u64 string
 }
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct GetRecordRequest {
     hash: [u8; 32],
@@ -46,7 +46,10 @@ fn get_mt(root: [u8; 32]) -> MongoMerkle<32> {
 
 async fn update_leaf(Params(request): Params<UpdateLeafRequest>) -> Result<[u8; 32], Error> {
     let start = Instant::now();
-    let index = u64::from_str_radix(request.index.as_str(), 10).unwrap();
+    // Parse the client-supplied index strictly: an unparsable index must be
+    // reported as an invalid-params error instead of panicking the worker.
+    let index = u64::from_str_radix(request.index.as_str(), 10)
+        .map_err(|_| Error::INVALID_PARAMS)?;
     let hash = actix_web::web::block(move || {
         let mut mt = get_mt(request.root);
         mt.update_leaf_data_with_proof(index, &request.data.to_vec())
@@ -65,7 +68,9 @@ async fn update_leaf(Params(request): Params<UpdateLeafRequest>) -> Result<[u8; 
 
 async fn get_leaf(Params(request): Params<GetLeafRequest>) -> Result<[u8; 32], Error> {
     let start = Instant::now();
-    let index = u64::from_str_radix(request.index.as_str(), 10).unwrap();
+    // Same strict parsing as update_leaf: never panic on client input.
+    let index = u64::from_str_radix(request.index.as_str(), 10)
+        .map_err(|_| Error::INVALID_PARAMS)?;
     let leaf = actix_web::web::block(move || {
         let mt = get_mt(request.root);
         let (leaf, _) = mt.get_leaf_with_proof(index).map_err(|e| {
@@ -82,21 +87,21 @@ async fn get_leaf(Params(request): Params<GetLeafRequest>) -> Result<[u8; 32], E
         l.data.unwrap_or([0; 32])
     })
 }
+
 async fn update_record(Params(request): Params<UpdateRecordRequest>) -> Result<(), Error> {
+    // Validate every element before entering the blocking task so malformed
+    // records surface as invalid-params errors instead of panicking.
+    let mut data_bytes: Vec<u8> = Vec::with_capacity(request.data.len() * 8);
+    for x in request.data.iter() {
+        let v = u64::from_str_radix(x, 10).map_err(|_| Error::INVALID_PARAMS)?;
+        data_bytes.extend_from_slice(&v.to_le_bytes());
+    }
     let _ = actix_web::web::block(move || {
         let mut mongo_datahash = MongoDataHash::construct([0; 32], unsafe { DB.clone() });
         mongo_datahash.update_record({
             DataHashRecord {
                 hash: request.hash,
-                data: request
-                    .data
-                    .iter()
-                    .map(|x| {
-                        let x = u64::from_str_radix(x, 10).unwrap();
-                        x.to_le_bytes()
-                    })
-                    .flatten()
-                    .collect::<Vec<u8>>(),
+                data: data_bytes,
             }
         })
     })
@@ -108,10 +113,15 @@ async fn update_record(Params(request): Params<UpdateRecordRequest>) -> Result<(
 async fn get_record(Params(request): Params<GetRecordRequest>) -> Result<Vec<String>, Error> {
     let datahashrecord = actix_web::web::block(move || {
         let mongo_datahash = MongoDataHash::construct([0; 32], unsafe { DB.clone() });
-        mongo_datahash.get_record(&request.hash).unwrap()
+        // Report storage-layer failures as internal errors instead of
+        // panicking inside the blocking task.
+        mongo_datahash.get_record(&request.hash).map_err(|e| {
+            println!("get record error {:?}", e);
+            Error::INTERNAL_ERROR
+        })
     })
     .await
-    .map_err(|_| Error::INTERNAL_ERROR)?;
+    .map_err(|_| Error::INTERNAL_ERROR)??;
     let data = datahashrecord.map_or(vec![], |r| {
         r.data
             .chunks_exact(8)
